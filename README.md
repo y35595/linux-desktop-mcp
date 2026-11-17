@@ -4,6 +4,8 @@ A fast, dependency-light [Model Context Protocol](https://modelcontextprotocol.i
 
 No C bindings, no system dev headers, no subprocess per action. One static binary.
 
+English | [简体中文](README.zh-CN.md)
+
 ```
 operation                          latency
 ──────────────────────────────────────────────────
