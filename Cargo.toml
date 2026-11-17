@@ -1,0 +1,21 @@
+[package]
+name = "linux-desktop-mcp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "linux-desktop-mcp"
+path = "src/main.rs"
+
+[dependencies]
+x11rb = { version = "0.13", features = ["xtest"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
