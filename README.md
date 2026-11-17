@@ -31,7 +31,7 @@ Wayland is **not** supported: it blocks synthetic input for ordinary clients by 
 ## Build
 
 ```sh
-git clone https://github.com/<you>/linux-desktop-mcp
+git clone https://github.com/y35595/linux-desktop-mcp
 cd linux-desktop-mcp
 cargo build --release
 # binary: ./target/release/linux-desktop-mcp
