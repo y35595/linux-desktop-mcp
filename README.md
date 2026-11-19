@@ -209,6 +209,20 @@ A locked screen cannot be captured: the compositor will not paint the desktop in
 - **`type` on the uinput backend covers the US layout.** Non-Latin text returns a precise error naming the character instead of typing the wrong thing.
 - **One screen assumed.** Multi-monitor coordinate handling across outputs is untested.
 
+### Verified configuration
+
+The Wayland path is exercised on GNOME 48 / mutter 48.1 with fractional scaling at 1.7467 (3200×2000 native, 1832×1145 logical):
+
+- capture returns real desktop content, and a region capture is pixel-identical to the same crop of a full capture
+- the compositor scale is read from `DisplayConfig` (1.7467248439788818), not guessed
+- a synthetic **Super** keypress through the uinput keyboard opens the GNOME overview
+- a click at `y=1870` places the text caret at `y=1866` — 4 px on a 2000 px-tall screen
+- `click` and `drag` both act on the widget under the requested coordinate
+
+`grim` and KDE are not exercised on that host (no wlroots or Plasma session was available).
+
+> **Testing note.** `XQueryPointer` is not a valid probe for the uinput backend on Wayland: the compositor owns the pointer and Xwayland's mirror does not follow injected events, so it reports a stale position even while clicks land correctly. Verify with an observable UI effect instead.
+
 ## How it works
 
 | File | Role |

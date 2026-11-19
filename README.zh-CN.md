@@ -211,6 +211,20 @@ before calling click/mouse_move, or pass max_width=3200 to get 1:1 pixels.
 - **`scroll` 在 X11 后端使用按钮 4/5/6/7，在 uinput 后端使用 `REL_WHEEL`/`REL_HWHEEL`。**
 - **默认单屏。** 跨 RandR 输出的多显示器坐标处理未经测试。
 
+### 已验证配置
+
+Wayland 路径在 GNOME 48 / mutter 48.1、分数缩放 1.7467（原生 3200×2000，逻辑 1832×1145）下实际跑通：
+
+- 截图返回真实桌面内容，且区域截图与全屏同位置裁剪**逐像素相同**
+- 合成器缩放由 `DisplayConfig` 读取（1.7467248439788818），不是猜测
+- 通过 uinput 键盘发送 **Super** 键可打开 GNOME 概览
+- 点击 `y=1870` 时光标落在 `y=1866`——2000px 高的屏幕上误差 4px
+- `click` 与 `drag` 都作用于请求坐标下的真实控件
+
+该主机上 `grim` 与 KDE 未验证（没有 wlroots 或 Plasma 会话可用）。
+
+> **测试提示。** 在 Wayland 下 `XQueryPointer` **不是** uinput 后端的有效探测手段：指针归合成器所有，Xwayland 的镜像不跟随注入事件，因此即使点击已正确落点，它仍会报告过期位置。请改用可观察的界面效果来验证。
+
 ## 实现说明
 
 | 文件 | 职责 |
