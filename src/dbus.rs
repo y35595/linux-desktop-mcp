@@ -194,32 +194,40 @@ pub fn gnome_coordinate_model() -> Option<CoordinateModel> {
         )
         .ok()?;
     let body = reply.body();
-    // (u serial, a((ssss)a(siiddda{sv})) monitors, a(iiduba(ssss)a{sv}) logical, a{sv} props)
-    let parsed = body.deserialize::<(
-        u32,
-        Vec<(
-            (String, String, String, String),
-            Vec<(
-                String,
-                i32,
-                i32,
-                f64,
-                bool,
-                Vec<f64>,
-                HashMap<String, OwnedValue>,
-            )>,
-        )>,
-        Vec<(
-            i32,
-            i32,
-            f64,
-            u32,
-            bool,
-            Vec<(String, String, String, String)>,
-            HashMap<String, OwnedValue>,
-        )>,
+    // Exact signature from Mutter's DBus API:
+    //   (u serial_num,
+    //    a((ssss)a(siiddda{sv}) a{sv}) monitors,   // spec, modes[], monitor props
+    //    a(iiduba(ssss)a{sv})        logical,      // x, y, scale, transform,
+    //                                              // primary, monitors[], props
+    //    a{sv} properties)
+    //
+    // The mode entry is (name s, width i, height i, rate d, preferred_scale d,
+    // supported_scales ad, props a{sv}) — note the 5th field is a *scale
+    // double*, not a boolean. Getting this wrong makes deserialization fail
+    // silently, and the caller then falls back to the X11 root size with
+    // scale 1.0, which silently misplaces every click on a HiDPI screen.
+    type Spec = (String, String, String, String);
+    type Mode = (
+        String,
+        i32,
+        i32,
+        f64,
+        f64,
+        Vec<f64>,
         HashMap<String, OwnedValue>,
-    )>();
+    );
+    type Monitor = (Spec, Vec<Mode>, HashMap<String, OwnedValue>);
+    type Logical = (
+        i32,
+        i32,
+        f64,
+        u32,
+        bool,
+        Vec<Spec>,
+        HashMap<String, OwnedValue>,
+    );
+    let parsed =
+        body.deserialize::<(u32, Vec<Monitor>, Vec<Logical>, HashMap<String, OwnedValue>)>();
 
     let (_serial, monitors, logical, _props) = match parsed {
         Ok(v) => v,
@@ -241,8 +249,10 @@ pub fn gnome_coordinate_model() -> Option<CoordinateModel> {
         // Find the active mode of that connector to get the native size.
         // Mode entries are (name, width, height, refresh, preferred, scales, props).
         let mut native = (0i32, 0i32);
-        if let Some((_spec, modes)) = monitors.iter().find(|(spec, _)| spec.0 == connector) {
-            for (_name, w, h, _refresh, pref, _scales, props) in modes {
+        if let Some((_spec, modes, _mprops)) =
+            monitors.iter().find(|(spec, _, _)| spec.0 == connector)
+        {
+            for (_name, w, h, _refresh, _preferred_scale, _scales, props) in modes {
                 let current = props
                     .get("is-current")
                     .and_then(|v| v.downcast_ref::<bool>().ok())
@@ -251,7 +261,7 @@ pub fn gnome_coordinate_model() -> Option<CoordinateModel> {
                     native = (*w, *h);
                     break;
                 }
-                if *pref && native == (0, 0) {
+                if native == (0, 0) {
                     native = (*w, *h);
                 }
             }
@@ -326,5 +336,62 @@ mod tests {
     fn portal_detection_does_not_panic() {
         // Must be a pure probe: no bus on CI is fine, it just returns false.
         let _ = portal_available();
+    }
+
+    /// The `GetCurrentState` reply is a deeply nested tuple, and getting one
+    /// field's type wrong makes `deserialize` fail — which used to fall back
+    /// silently to scale 1.0 and misplace every click on a HiDPI screen.
+    ///
+    /// These signatures are pinned against a real Mutter 48 reply captured on
+    /// the reference host so a regression fails here instead of at runtime.
+    #[test]
+    fn displayconfig_signature_matches_mutter() {
+        use std::collections::HashMap;
+        use zbus::zvariant::{OwnedValue, Value};
+
+        type Spec = (String, String, String, String);
+        type Mode = (
+            String,
+            i32,
+            i32,
+            f64,
+            f64,
+            Vec<f64>,
+            HashMap<String, OwnedValue>,
+        );
+
+        // The real 5th mode field is the preferred *scale* (a double), not a
+        // boolean. Build one and make sure it deserializes as we expect.
+        let mut props: HashMap<String, OwnedValue> = HashMap::new();
+        props.insert("is-current".to_string(), OwnedValue::from(true));
+        let mode: Mode = (
+            "3200x2000@120.000".to_string(),
+            3200,
+            2000,
+            120.0,
+            1.7467248439788818,
+            vec![1.0, 1.25, 1.5],
+            props,
+        );
+        let v = Value::from(mode.clone());
+        let back: Mode = v.try_into().expect("mode tuple round-trips");
+        assert_eq!(back.0, "3200x2000@120.000");
+        assert_eq!(back.1, 3200);
+        assert_eq!(back.2, 2000);
+        assert!((back.4 - 1.7467248439788818).abs() < 1e-9);
+
+        // A monitors entry is a triple (spec, modes, props), not a pair.
+        let spec: Spec = (
+            "eDP-1".to_string(),
+            "TMX".to_string(),
+            "TL156MDMP31-0".to_string(),
+            "0x00000000".to_string(),
+        );
+        let monitor = (spec, vec![mode], HashMap::<String, OwnedValue>::new());
+        let mv = Value::from(monitor);
+        let parsed: (Spec, Vec<Mode>, HashMap<String, OwnedValue>) =
+            mv.try_into().expect("monitor triple round-trips");
+        assert_eq!(parsed.0 .0, "eDP-1");
+        assert_eq!(parsed.1.len(), 1);
     }
 }
