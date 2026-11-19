@@ -208,6 +208,64 @@ pub struct Availability {
 /// Probe `/dev/uinput` by opening it and closing again.
 ///
 /// This never creates a device, so it is safe to call at startup.
+/// Read the groups the *current process* is a member of.
+///
+/// `/etc/group` may list the user while the running session has not inherited
+/// membership yet — group changes only apply at login. Distinguishing those two
+/// cases turns a confusing "permission denied" into an actionable message.
+fn process_groups() -> Vec<u32> {
+    #[repr(C)]
+    struct Group {
+        gr_name: *const u8,
+    }
+    extern "C" {
+        fn getgroups(size: i32, list: *mut u32) -> i32;
+    }
+    let mut buf = vec![0u32; 64];
+    // SAFETY: buf is a valid, correctly-sized mutable buffer.
+    let n = unsafe { getgroups(buf.len() as i32, buf.as_mut_ptr()) };
+    if n < 0 {
+        return Vec::new();
+    }
+    buf.truncate(n as usize);
+    let _ = std::mem::size_of::<Group>();
+    buf
+}
+
+/// Does `/etc/group` list the current user in `input`?
+fn user_listed_in_input_group() -> bool {
+    let Ok(groups) = std::fs::read_to_string("/etc/group") else {
+        return false;
+    };
+    let Ok(uid_name) = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")) else {
+        return false;
+    };
+    groups.lines().any(|line| {
+        let mut parts = line.split(':');
+        matches!(parts.next(), Some("input"))
+            && parts
+                .nth(2)
+                .map(|members| members.split(',').any(|m| m.trim() == uid_name))
+                .unwrap_or(false)
+    })
+}
+
+/// The gid of the `input` group, if it exists.
+fn input_gid() -> Option<u32> {
+    let groups = std::fs::read_to_string("/etc/group").ok()?;
+    for line in groups.lines() {
+        let mut parts = line.split(':');
+        if parts.next() == Some("input") {
+            return parts.next().and_then(|g| g.parse().ok());
+        }
+    }
+    None
+}
+
+/// Whether a uinput device can be created right now, and if not, why.
+///
+/// The reason strings are written to be actionable: they name the single next
+/// step rather than restating the error.
 pub fn probe() -> Availability {
     match OpenOptions::new().write(true).open("/dev/uinput") {
         Ok(_) => Availability {
@@ -215,18 +273,58 @@ pub fn probe() -> Availability {
             reason: "ok".to_string(),
         },
         Err(e) => {
+            use std::os::unix::fs::PermissionsExt;
             let exists = std::fs::metadata("/dev/uinput").is_ok();
-            let reason = if !exists {
-                "uinput-unavailable: /dev/uinput does not exist (load the `uinput` module)"
-                    .to_string()
-            } else {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata("/dev/uinput")
-                    .map(|m| m.permissions().mode() & 0o777)
-                    .unwrap_or(0);
+            if !exists {
+                return Availability {
+                    usable: false,
+                    reason:
+                        "uinput-missing: /dev/uinput does not exist — run `sudo modprobe uinput`"
+                            .to_string(),
+                };
+            }
+            let mode = std::fs::metadata("/dev/uinput")
+                .map(|m| m.permissions().mode() & 0o777)
+                .unwrap_or(0);
+            let gid_now = process_groups();
+            let gid_input = input_gid();
+            let in_group_now = gid_input.map(|g| gid_now.contains(&g)).unwrap_or(false);
+            let listed = user_listed_in_input_group();
+
+            let reason = if mode == 0o600 {
+                // The udev rule has not been applied to the device node yet.
+                if listed || in_group_now {
+                    format!(
+                        "uinput-stale-node: /dev/uinput is still mode {mode:04o}, so the udev \
+                         rule has not been applied to the node yet. It was installed but the \
+                         node was created before it took effect — run `sudo udevadm control \
+                         --reload-rules && sudo udevadm trigger --name-match=uinput` (or \
+                         reboot) so it becomes crw-rw---- root input."
+                    )
+                } else {
+                    format!(
+                        "uinput-permission: /dev/uinput is mode {mode:04o} and not writable. \
+                         Install the udev rule and join the `input` group (see README), then \
+                         reboot. os error: {e}"
+                    )
+                }
+            } else if listed && !in_group_now {
                 format!(
-                    "uinput-permission: /dev/uinput is mode {mode:04o} and not writable by this user \
-                     (needs the udev rule + `input` group; see README). os error: {e}"
+                    "uinput-relogin: /dev/uinput is mode {mode:04o} and you are listed in the \
+                     `input` group in /etc/group, but this login session has not inherited that \
+                     group yet. Group membership only applies at login: log out and back in \
+                     (a new terminal is not enough). os error: {e}"
+                )
+            } else if !in_group_now {
+                format!(
+                    "uinput-permission: /dev/uinput is mode {mode:04o} and this process is not \
+                     in the `input` group. Run `sudo usermod -aG input $USER`, then log out and \
+                     back in. os error: {e}"
+                )
+            } else {
+                format!(
+                    "uinput-denied: in the `input` group and /dev/uinput is mode {mode:04o}, \
+                     but opening it still failed. os error: {e}"
                 )
             };
             Availability {
@@ -815,5 +913,26 @@ mod tests {
     fn availability_probe_never_creates_a_device() {
         let a = probe();
         assert!(!a.reason.is_empty());
+        // The reason must always name a stage, so a caller can act on it.
+        if !a.usable {
+            assert!(
+                a.reason.starts_with("uinput-"),
+                "reason should be stage-tagged, got {:?}",
+                a.reason
+            );
+        }
+    }
+
+    #[test]
+    fn process_groups_are_read_without_panicking() {
+        // Must never panic regardless of the environment.
+        let g = process_groups();
+        let _ = g.contains(&0);
+    }
+
+    #[test]
+    fn input_group_lookup_is_total() {
+        let _ = input_gid();
+        let _ = user_listed_in_input_group();
     }
 }

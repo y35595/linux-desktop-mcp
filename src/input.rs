@@ -471,9 +471,19 @@ fn uinput_range(model: &CoordinateModel) -> Result<(i32, i32)> {
     if model.physical_width > 1 && model.physical_height > 1 {
         return Ok((model.physical_width, model.physical_height));
     }
+    // The true native size is only known after a capture. Until then, derive it
+    // from the logical size and the compositor scale so a click before any
+    // screenshot still lands in the right ballpark instead of failing outright.
+    if model.logical_width > 1 && model.logical_height > 1 {
+        let w = (model.logical_width as f64 * model.scale).round() as i32;
+        let h = (model.logical_height as f64 * model.scale).round() as i32;
+        if w > 1 && h > 1 {
+            return Ok((w, h));
+        }
+    }
     Err(anyhow!(
-        "the capture size is not known yet; take a screenshot first so the \
-         absolute pointer can be sized to the screen"
+        "the screen size is not known yet, so the absolute pointer cannot be sized. \
+         Take one screenshot first (the compositor did not report a screen geometry)"
     ))
 }
 
@@ -611,8 +621,35 @@ mod tests {
     }
 
     #[test]
-    fn uinput_range_requires_a_known_capture() {
-        let m = CoordinateModel::unknown();
-        assert!(uinput_range(&m).is_err());
+    fn uinput_range_falls_back_to_logical_times_scale() {
+        // A logical size plus the compositor scale is enough to size the device
+        // before any screenshot has been taken.
+        let m = CoordinateModel {
+            logical_width: 1832,
+            logical_height: 1145,
+            scale: 1.7467248439788818,
+            ..Default::default()
+        };
+        let (w, h) = uinput_range(&m).unwrap();
+        assert_eq!(w, 3200, "1832 * 1.7467 rounds to 3200");
+        assert_eq!(h, 2000, "1145 * 1.7467 rounds to 2000");
+    }
+
+    #[test]
+    fn uinput_range_prefers_the_real_capture_size() {
+        let m = CoordinateModel {
+            physical_width: 3200,
+            physical_height: 2000,
+            logical_width: 1832,
+            logical_height: 1145,
+            scale: 1.7467248439788818,
+            ..Default::default()
+        };
+        assert_eq!(uinput_range(&m).unwrap(), (3200, 2000));
+    }
+
+    #[test]
+    fn uinput_range_still_errors_when_nothing_is_known() {
+        assert!(uinput_range(&CoordinateModel::unknown()).is_err());
     }
 }

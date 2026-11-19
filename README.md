@@ -71,6 +71,22 @@ ls -l /dev/uinput                                  # crw-rw---- root input
 
 Until this is done the server still runs: capture works, and keyboard input falls back to mutter. `click`/`mouse_move` return a clear error naming this step rather than pretending to work.
 
+**If `/dev/uinput` still shows `crw------- root root 0600` after installing the rule**, the node was created before the rule took effect. Apply it to the existing node without rebooting:
+
+```sh
+sudo udevadm control --reload-rules
+sudo udevadm trigger --name-match=uinput
+```
+
+The startup diagnostic distinguishes the stages, so you can tell which one you are in:
+
+| stderr tag | meaning | next step |
+|---|---|---|
+| `uinput-missing` | `/dev/uinput` absent | `sudo modprobe uinput` |
+| `uinput-stale-node` | rule installed, node still `0600` | `udevadm trigger` above |
+| `uinput-relogin` | you are in the `input` group in `/etc/group`, but this login has not inherited it | log out and back in |
+| `uinput-permission` | not in the `input` group | `usermod -aG input`, then re-login |
+
 > **Security note.** Membership of `input` also grants read access to every `/dev/input/event*` device, which is keylogging-capable. On a shared machine prefer a dedicated group that owns only `/dev/uinput`.
 
 ## Build

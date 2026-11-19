@@ -71,6 +71,22 @@ ls -l /dev/uinput      # crw-rw---- root input
 ./linux-desktop-mcp    # stderr 应显示 input='uinput (absolute pointer + keyboard)'
 ```
 
+**如果装好规则后 `/dev/uinput` 仍是 `crw------- root root 0600`**，说明节点是在规则生效前创建的。无需重启，直接对现有节点应用：
+
+```sh
+sudo udevadm control --reload-rules
+sudo udevadm trigger --name-match=uinput
+```
+
+启动诊断会区分卡在哪一步：
+
+| stderr 标签 | 含义 | 下一步 |
+|---|---|---|
+| `uinput-missing` | `/dev/uinput` 不存在 | `sudo modprobe uinput` |
+| `uinput-stale-node` | 规则已装，但节点仍是 `0600` | 执行上面的 `udevadm trigger` |
+| `uinput-relogin` | `/etc/group` 里已在 `input` 组，但当前登录没继承 | 注销并重新登录 |
+| `uinput-permission` | 不在 `input` 组 | `usermod -aG input` 后重新登录 |
+
 未完成该步骤时服务仍可运行：截图正常，键盘回落到 mutter；`click`/`mouse_move` 会返回明确指向该步骤的错误，而不是假装成功。
 
 > **安全提示。** `input` 组成员同时能读所有 `/dev/input/event*`，具备记录键盘输入的能力。在共享机器上建议改用只拥有 `/dev/uinput` 的专用组。
