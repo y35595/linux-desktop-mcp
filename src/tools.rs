@@ -1,7 +1,11 @@
 //! Tool dispatch: each MCP tool maps to one function here.
 
+use crate::capture::Capture;
+use crate::input::Input;
+use crate::platform::{CoordinateModel, Platform, SessionKind};
 use crate::protocol::{image_result, text_result};
-use crate::x11::{Desktop, Keymap};
+use crate::uinput::Button;
+use crate::x11::Desktop;
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use image::{ImageEncoder, RgbImage};
@@ -9,7 +13,6 @@ use serde_json::{json, Value};
 use std::io::Cursor;
 use std::sync::Mutex;
 
-/// Tool call latency accounting, exposed through `desktop_stats`.
 /// Facts about one capture that an agent needs in order to click accurately.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CaptureMeta {
@@ -32,8 +35,11 @@ pub struct Stats {
 }
 
 pub struct App {
-    pub desktop: Desktop,
-    pub keymap: Mutex<Option<Keymap>>,
+    pub platform: Platform,
+    pub capture: Capture,
+    pub input: Input,
+    /// The coordinate model, refined once a capture reveals the real size.
+    pub model: Mutex<CoordinateModel>,
     pub stats: Mutex<Stats>,
 }
 
@@ -48,158 +54,110 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
 }
 
-/// Map a name like "ctrl+shift+t" to X keysyms.
-fn parse_hotkey(spec: &str) -> Result<Vec<u32>> {
-    let mut syms = Vec::new();
-    for raw in spec.split('+') {
-        let part = raw.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let lower = part.to_ascii_lowercase();
-        let sym = match lower.as_str() {
-            "ctrl" | "control" => 0xffe3,
-            "shift" => 0xffe1,
-            "alt" | "mod1" => 0xffe9,
-            "super" | "meta" | "win" | "mod4" => 0xffeb,
-            "enter" | "return" => 0xff0d,
-            "tab" => 0xff09,
-            "esc" | "escape" => 0xff1b,
-            "space" => 0x0020,
-            "backspace" => 0xff08,
-            "delete" | "del" => 0xffff,
-            "home" => 0xff50,
-            "end" => 0xff57,
-            "pageup" => 0xff55,
-            "pagedown" => 0xff56,
-            "up" => 0xff52,
-            "down" => 0xff54,
-            "left" => 0xff51,
-            "right" => 0xff53,
-            "insert" => 0xff63,
-            other => {
-                if other.len() == 1 {
-                    let c = other.chars().next().unwrap();
-                    char_to_keysym(c)
-                } else if let Some(rest) = other.strip_prefix('f') {
-                    if let Ok(n) = rest.parse::<u32>() {
-                        if (1..=24).contains(&n) {
-                            0xffbe + (n - 1)
-                        } else {
-                            return Err(anyhow!("unsupported function key {}", other));
-                        }
-                    } else {
-                        return Err(anyhow!("unknown key '{}'", part));
-                    }
-                } else {
-                    return Err(anyhow!("unknown key '{}'", part));
-                }
-            }
-        };
-        syms.push(sym);
-    }
-    if syms.is_empty() {
-        return Err(anyhow!("empty hotkey"));
-    }
-    Ok(syms)
-}
-
-fn char_to_keysym(c: char) -> u32 {
-    // Latin-1 maps directly; ASCII maps directly; everything else via a small table.
-    let cp = c as u32;
-    if (0x20..=0x7e).contains(&cp) || (0xa0..=0xff).contains(&cp) {
-        cp
-    } else {
-        match c {
-            '\n' => 0xff0d,
-            '\t' => 0xff09,
-            _ => cp | 0x0100_0000, // Unicode keysym convention
-        }
-    }
-}
-
 impl App {
     pub fn new() -> Result<Self> {
-        let desktop = Desktop::connect()?;
-        Ok(App {
+        let platform = Platform::detect();
+
+        // Connect to X whenever DISPLAY exists. On Wayland this is Xwayland:
+        // unusable for capture and XTEST, but still the only way to enumerate
+        // Xwayland client windows.
+        let desktop = match Desktop::connect(platform.is_real_x11()) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                if platform.session == SessionKind::X11 {
+                    return Err(e.context(
+                        "cannot initialise the X11 backend (DISPLAY is set but unreachable)",
+                    ));
+                }
+                None
+            }
+        };
+
+        let capture = Capture::detect(platform.clone());
+
+        // Prefer the compositor's authoritative scale; fall back to the X root.
+        let mut model = CoordinateModel::unknown();
+        let mut warnings: Vec<String> = Vec::new();
+        if platform.compositor == crate::platform::Compositor::Gnome {
+            if let Some(m) = crate::dbus::gnome_coordinate_model() {
+                model = m;
+            }
+        }
+        if model.logical_width == 0 {
+            if let Some((w, h)) = crate::dbus::x11_root_size() {
+                model.logical_width = w;
+                model.logical_height = h;
+                model.scale_source = "x11 root window size";
+            }
+        }
+        if model.logical_width == 0 {
+            warnings.push(
+                "the logical screen size is unknown; it will be derived on the first capture"
+                    .to_string(),
+            );
+        }
+
+        let input = Input::detect(
+            platform.session,
             desktop,
-            keymap: Mutex::new(None),
+            crate::mutter::available(),
+            warnings.clone(),
+        );
+        if !input.has_absolute_pointer() {
+            warnings.push(format!(
+                "pointer control unavailable with the '{}' backend — clicks will not land. \
+                 See the README section on /dev/uinput.",
+                input.backend().as_str()
+            ));
+        }
+
+        let app = App {
+            platform,
+            capture,
+            input,
+            model: Mutex::new(model),
             stats: Mutex::new(Stats::default()),
-        })
-    }
-
-    fn ensure_keymap(&self) -> Result<()> {
-        let mut guard = self.keymap.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(Keymap::build(self.desktop.conn())?);
+        };
+        for w in &app.input.notes {
+            eprintln!("[linux-desktop-mcp] {w}");
         }
-        Ok(())
-    }
-
-    fn type_text(&self, text: &str) -> Result<()> {
-        self.ensure_keymap()?;
-        let guard = self.keymap.lock().unwrap();
-        let km = guard.as_ref().unwrap();
-        let shift_code = km.lookup(0xffe1).map(|(c, _)| c);
-        for ch in text.chars() {
-            let sym = char_to_keysym(ch);
-            let (code, needs_shift) = km
-                .lookup(sym)
-                .ok_or_else(|| anyhow!("no keycode for character {:?}", ch))?;
-            let shift = needs_shift.then_some(shift_code).flatten();
-            if let Some(s) = shift {
-                self.desktop.key(s, true)?;
-            }
-            self.desktop.key(code, true)?;
-            self.desktop.key(code, false)?;
-            if let Some(s) = shift {
-                self.desktop.key(s, false)?;
-            }
-            self.desktop.sync();
-        }
-        Ok(())
-    }
-
-    fn hotkey(&self, spec: &str) -> Result<()> {
-        self.ensure_keymap()?;
-        let syms = parse_hotkey(spec)?;
-        let guard = self.keymap.lock().unwrap();
-        let km = guard.as_ref().unwrap();
-        let mut codes = Vec::new();
-        for sym in syms {
-            let (code, _) = km
-                .lookup(sym)
-                .ok_or_else(|| anyhow!("no keycode for keysym 0x{:x} in '{}'", sym, spec))?;
-            codes.push(code);
-        }
-        // Press all modifiers, then the final key, then release in reverse.
-        for &c in &codes {
-            self.desktop.key(c, true)?;
-        }
-        for &c in codes.iter().rev() {
-            self.desktop.key(c, false)?;
-        }
-        self.desktop.sync();
-        Ok(())
+        eprintln!(
+            "[linux-desktop-mcp] session={} compositor={} capture='{}' input='{}'",
+            app.platform.session.as_str(),
+            app.platform.compositor.as_str(),
+            app.capture.backend().as_str(),
+            app.input.backend().as_str()
+        );
+        Ok(app)
     }
 
     /// Encode a frame as PNG or JPEG and return base64.
     fn encode(
         &self,
-        region: Option<(i16, i16, u16, u16)>,
+        region: Option<(i32, i32, u32, u32)>,
         max_width: Option<u32>,
         format: &str,
         quality: u8,
     ) -> Result<(String, String, String, CaptureMeta)> {
         let t0 = std::time::Instant::now();
-        let frame = self.desktop.capture(region)?;
+        let frame = match region {
+            Some((x, y, w, h)) => self.capture.capture_region(x, y, w, h)?,
+            None => self.capture.capture_full()?,
+        };
         let cap_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        let mut img = RgbImage::from_raw(frame.width as u32, frame.height as u32, frame.rgb)
-            .ok_or_else(|| anyhow!("failed to build image buffer"))?;
+        // The first capture tells us the true native resolution. Fold that back
+        // into the coordinate model so input converts against real numbers.
+        {
+            let mut m = self.model.lock().unwrap();
+            m.reconcile_with_capture(frame.width as i32, frame.height as i32);
+        }
+
+        let mut img = RgbImage::from_raw(frame.width, frame.height, frame.rgb)
+            .ok_or_else(|| anyhow!("failed to build the image buffer"))?;
 
         if let Some(mw) = max_width {
-            if img.width() > mw && mw > 0 {
+            if mw > 0 && img.width() > mw {
                 let nh = (img.height() as f64 * (mw as f64 / img.width() as f64)).round() as u32;
                 img = image::imageops::resize(
                     &img,
@@ -227,57 +185,82 @@ impl App {
 
         let bytes = buf.into_inner();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let (ox, oy, sw, _sh) = (
-            region.map(|r| r.0).unwrap_or(0) as i32,
-            region.map(|r| r.1).unwrap_or(0) as i32,
-            frame.width as u32,
-            frame.height as u32,
+
+        let (ox, oy) = (
+            region.map(|r| r.0).unwrap_or(0),
+            region.map(|r| r.1).unwrap_or(0),
         );
+        let src_w = frame.width;
+        let model = self.model.lock().unwrap().clone();
         let meta = CaptureMeta {
-            screen_width: self.desktop.geom().width as u32,
-            screen_height: self.desktop.geom().height as u32,
+            screen_width: model.physical_width.max(0) as u32,
+            screen_height: model.physical_height.max(0) as u32,
             image_width: img.width(),
             image_height: img.height(),
             origin_x: ox,
             origin_y: oy,
-            scale: if sw > 0 {
-                img.width() as f64 / sw as f64
+            scale: if src_w > 0 {
+                img.width() as f64 / src_w as f64
             } else {
                 1.0
             },
         };
 
-        // State the scale explicitly: an agent that reads pixels off this image
-        // MUST multiply by 1/scale before clicking, or every click lands in the
-        // upper-left of the intended target.
         let mut caption = format!(
-            "image {}x{} {} {}KB capture {:.1}ms",
+            "image {}x{} {} {}KB capture {:.1}ms via {}\ncoordinates: this image and all \
+             input tools share one space — a pixel read here (plus the origin) is the screen \
+             coordinate to pass to click/mouse_move.",
             img.width(),
             img.height(),
             if mime == "image/png" { "PNG" } else { "JPEG" },
             bytes.len() / 1024,
-            cap_ms
+            cap_ms,
+            self.capture.backend().as_str(),
         );
         if (meta.scale - 1.0).abs() > 0.001 {
             caption.push_str(&format!(
-                "\nSCALED: screen is {}x{} but this image is {}x{} (scale {:.4}). \
-                 Image pixel (u,v) belongs to screen coordinate ({},{}) — multiply by {:.4} before calling click/mouse_move, \
-                 or pass max_width={} to get 1:1 pixels.",
+                "\nSCALED for display only: the native screen is {}x{} while this image is \
+                 {}x{} (scale {:.4}). Multiply image pixels by {:.4} to get screen \
+                 coordinates, or pass max_width=0 for 1:1 pixels.",
                 meta.screen_width,
                 meta.screen_height,
                 img.width(),
                 img.height(),
                 meta.scale,
-                ox,
-                oy,
-                1.0 / meta.scale,
-                meta.screen_width
+                1.0 / meta.scale
             ));
         } else {
             caption.push_str(&format!(
                 "\n1:1 pixels, origin ({}, {}). Image pixel (u,v) = screen ({}+u, {}+v).",
                 ox, oy, ox, oy
             ));
+        }
+        if (model.scale - 1.0).abs() > 0.001 {
+            caption.push_str(&format!(
+                "\nHiDPI: native pixels are {}x the logical input space ({:.3}). This is \
+                 handled automatically.",
+                model.scale, model.scale
+            ));
+        }
+
+        // A locked session is the classic cause of an all-black capture that
+        // still "succeeds"; say so instead of returning a useless black image
+        // with no explanation.
+        if is_effectively_black(&img) {
+            if crate::dbus::session_locked() == Some(true) {
+                caption.push_str(
+                    "\nWARNING: the screen is LOCKED (org.gnome.ScreenSaver GetActive=true). \
+                     The compositor does not paint the desktop into a screenshot while the \
+                     lock screen is up, so this frame is black. Unlock the session to capture \
+                     the desktop.",
+                );
+            } else {
+                caption.push_str(
+                    "\nWARNING: this frame is essentially all black. If the desktop is not \
+                     actually black, check whether the session is locked or the compositor \
+                     is withholding content from the portal.",
+                );
+            }
         }
 
         let mut st = self.stats.lock().unwrap();
@@ -289,44 +272,22 @@ impl App {
     pub fn call(&self, name: &str, args: &Value) -> Result<Value> {
         match name {
             "screenshot" => {
-                let region = match (
-                    arg_i64(args, "x"),
-                    arg_i64(args, "y"),
-                    arg_i64(args, "width"),
-                    arg_i64(args, "height"),
-                ) {
-                    (Some(x), Some(y), Some(w), Some(h)) => {
-                        Some((x as i16, y as i16, w as u16, h as u16))
-                    }
-                    _ => None,
-                };
-                // max_width=0 or "native" means: keep 1:1 pixels so coordinates
-                // read off the image map directly onto the screen.
+                let region = region_args(args);
                 let max_w = match arg_i64(args, "max_width") {
                     Some(0) => None,
-                    Some(v) => Some(v as u32),
+                    Some(v) if v > 0 => Some(v as u32),
+                    Some(_) => None,
                     None => Some(1280),
                 };
                 let fmt = arg_str(args, "format").unwrap_or("jpeg");
-                let q = arg_i64(args, "quality").unwrap_or(75) as u8;
+                let q = arg_i64(args, "quality").unwrap_or(75).clamp(1, 100) as u8;
                 let (b64, mime, cap, _meta) = self.encode(region, max_w, fmt, q)?;
                 Ok(image_result(b64, &mime, cap))
             }
 
             "screenshot_file" => {
                 let path = arg_str(args, "path").ok_or_else(|| anyhow!("path is required"))?;
-                let region = match (
-                    arg_i64(args, "x"),
-                    arg_i64(args, "y"),
-                    arg_i64(args, "width"),
-                    arg_i64(args, "height"),
-                ) {
-                    (Some(x), Some(y), Some(w), Some(h)) => {
-                        Some((x as i16, y as i16, w as u16, h as u16))
-                    }
-                    _ => None,
-                };
-                let (b64, _mime, cap, _meta) = self.encode(region, None, "png", 75)?;
+                let (b64, _mime, cap, _meta) = self.encode(region_args(args), None, "png", 75)?;
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(b64)
                     .map_err(|e| anyhow!("decode failed: {e}"))?;
@@ -338,151 +299,169 @@ impl App {
             }
 
             "screen_info" => {
-                let g = self.desktop.geom();
+                let model = self.model.lock().unwrap().clone();
                 let mut v = json!({
-                    "width": g.width,
-                    "height": g.height,
-                    "display": std::env::var("DISPLAY").unwrap_or_default(),
-                    "session_type": std::env::var("XDG_SESSION_TYPE").unwrap_or_default(),
+                    "session_type": self.platform.session.as_str(),
+                    "compositor": self.platform.compositor.as_str(),
+                    "display": self.platform.display.clone().unwrap_or_default(),
+                    "wayland_display": self.platform.wayland_display.clone().unwrap_or_default(),
+                    "capture_backend": self.capture.backend().as_str(),
+                    "input_backend": self.input.backend().as_str(),
+                    "pointer": {
+                        "absolute": self.input.has_absolute_pointer(),
+                        "verifiable": self.input.backend().can_verify_pointer(),
+                    },
+                    "coordinates": {
+                        "screen_width": model.physical_width,
+                        "screen_height": model.physical_height,
+                        "logical_width": model.logical_width,
+                        "logical_height": model.logical_height,
+                        "scale": model.scale,
+                        "scale_source": model.scale_source,
+                        "known": model.physical_width > 0,
+                    },
+                    "monitors": model.monitors,
+                    "screen_locked": crate::dbus::session_locked(),
                 });
-                if let Some(active) = self.desktop.active_window() {
-                    v["active_window"] = serde_json::to_value(active)?;
+                if !self.input.notes.is_empty() {
+                    v["notes"] = json!(self.input.notes);
+                }
+                if let Some(d) = self.input.desktop() {
+                    if let Some(active) = d.active_window() {
+                        v["active_window"] = serde_json::to_value(active)?;
+                    }
                 }
                 Ok(text_result(serde_json::to_string_pretty(&v)?, false))
             }
 
             "list_windows" => {
-                let wins = self.desktop.list_windows()?;
-                Ok(text_result(serde_json::to_string_pretty(&wins)?, false))
+                let d = self.input.desktop().ok_or_else(|| {
+                    anyhow!(
+                        "windows cannot be enumerated: no X display. On Wayland only Xwayland \
+                         clients are visible to X11."
+                    )
+                })?;
+                let wins = d.list_windows()?;
+                let mut v = json!({ "windows": wins });
+                if self.platform.session == SessionKind::Wayland {
+                    v["warning"] = json!(
+                        "This is a Wayland session: the list only contains Xwayland \
+                         (X11) clients. Native Wayland windows are intentionally not \
+                         exposed to X11 and cannot be enumerated this way."
+                    );
+                }
+                Ok(text_result(serde_json::to_string_pretty(&v)?, false))
             }
 
-            "active_window" => match self.desktop.active_window() {
-                Some(w) => Ok(text_result(serde_json::to_string_pretty(&w)?, false)),
-                None => Ok(text_result("no active window found", true)),
-            },
+            "active_window" => {
+                let d = self
+                    .input
+                    .desktop()
+                    .ok_or_else(|| anyhow!("no X display available for window queries"))?;
+                match d.active_window() {
+                    Some(w) => Ok(text_result(serde_json::to_string_pretty(&w)?, false)),
+                    None => Ok(text_result(
+                        "no active X11 window found (on Wayland this normally means the \
+                         focused window is a native Wayland client, which X11 cannot see)",
+                        true,
+                    )),
+                }
+            }
 
             "focus_window" => {
                 let id =
                     arg_i64(args, "window_id").ok_or_else(|| anyhow!("window_id is required"))?;
-                self.desktop.activate(id as u32)?;
-                Ok(text_result(format!("focused window 0x{:x}", id), false))
+                let d = self
+                    .input
+                    .desktop()
+                    .ok_or_else(|| anyhow!("no X display available for window activation"))?;
+                d.activate(id as u32)?;
+                Ok(text_result(format!("focused window 0x{id:x}"), false))
             }
 
             "mouse_move" => {
-                let x = arg_i64(args, "x").ok_or_else(|| anyhow!("x is required"))? as i16;
-                let y = arg_i64(args, "y").ok_or_else(|| anyhow!("y is required"))? as i16;
+                let x = arg_i64(args, "x").ok_or_else(|| anyhow!("x is required"))? as i32;
+                let y = arg_i64(args, "y").ok_or_else(|| anyhow!("y is required"))? as i32;
+                let model = self.model_snapshot();
                 let t0 = std::time::Instant::now();
-                self.desktop.move_pointer(x, y)?;
+                let report = self.input.move_to(&model, x, y)?;
                 self.record_input(t0);
-                Ok(text_result(format!("moved pointer to ({x}, {y})"), false))
+                Ok(text_result(self.describe(&report, "moved pointer"), false))
             }
 
             "click" => {
-                let x = arg_i64(args, "x").map(|v| v as i16);
-                let y = arg_i64(args, "y").map(|v| v as i16);
-                let button = match arg_str(args, "button").unwrap_or("left") {
-                    "left" => 1u8,
-                    "middle" => 2,
-                    "right" => 3,
-                    other => other
-                        .parse::<u8>()
-                        .map_err(|_| anyhow!("bad button '{other}'"))?,
+                let at = match (arg_i64(args, "x"), arg_i64(args, "y")) {
+                    (Some(x), Some(y)) => Some((x as i32, y as i32)),
+                    _ => None,
                 };
-                let count = arg_i64(args, "count").unwrap_or(1).clamp(1, 3);
+                let button = Button::parse(arg_str(args, "button").unwrap_or("left"))?;
+                let count = arg_i64(args, "count").unwrap_or(1).clamp(1, 3) as u32;
+                let model = self.model_snapshot();
                 let t0 = std::time::Instant::now();
-                if let (Some(x), Some(y)) = (x, y) {
-                    self.desktop.move_pointer(x, y)?;
-                }
-                for _ in 0..count {
-                    self.desktop.click(button, true)?;
-                    self.desktop.click(button, false)?;
-                }
-                self.desktop.sync();
+                let report = self.input.click(&model, button, at, count)?;
                 self.record_input(t0);
                 Ok(text_result(
-                    format!("clicked button {button} x{count}{}", coords_note(x, y)),
+                    self.describe(&report, &format!("clicked {button:?} x{count}")),
                     false,
                 ))
             }
 
             "mouse_down" | "mouse_up" => {
-                let button = match arg_str(args, "button").unwrap_or("left") {
-                    "left" => 1u8,
-                    "middle" => 2,
-                    "right" => 3,
-                    other => other
-                        .parse::<u8>()
-                        .map_err(|_| anyhow!("bad button '{other}'"))?,
-                };
+                let button = Button::parse(arg_str(args, "button").unwrap_or("left"))?;
                 let t0 = std::time::Instant::now();
-                self.desktop.click(button, name == "mouse_down")?;
-                self.desktop.sync();
+                self.input.button(button, name == "mouse_down")?;
                 self.record_input(t0);
-                Ok(text_result(format!("{name} button {button}"), false))
+                let verb = if name == "mouse_down" {
+                    "pressed"
+                } else {
+                    "released"
+                };
+                Ok(text_result(format!("{verb} {button:?}"), false))
             }
 
             "drag" => {
                 let (x1, y1) = (
-                    arg_i64(args, "x1").ok_or_else(|| anyhow!("x1 required"))? as i16,
-                    arg_i64(args, "y1").ok_or_else(|| anyhow!("y1 required"))? as i16,
+                    arg_i64(args, "x1").ok_or_else(|| anyhow!("x1 required"))? as i32,
+                    arg_i64(args, "y1").ok_or_else(|| anyhow!("y1 required"))? as i32,
                 );
                 let (x2, y2) = (
-                    arg_i64(args, "x2").ok_or_else(|| anyhow!("x2 required"))? as i16,
-                    arg_i64(args, "y2").ok_or_else(|| anyhow!("y2 required"))? as i16,
+                    arg_i64(args, "x2").ok_or_else(|| anyhow!("x2 required"))? as i32,
+                    arg_i64(args, "y2").ok_or_else(|| anyhow!("y2 required"))? as i32,
                 );
-                let button = match arg_str(args, "button").unwrap_or("left") {
-                    "left" => 1u8,
-                    "right" => 3,
-                    "middle" => 2,
-                    _ => 1,
-                };
+                let button = Button::parse(arg_str(args, "button").unwrap_or("left"))?;
                 let steps = arg_i64(args, "steps").unwrap_or(12).clamp(1, 100) as i32;
+                let model = self.model_snapshot();
                 let t0 = std::time::Instant::now();
-                self.desktop.move_pointer(x1, y1)?;
-                self.desktop.click(button, true)?;
+                self.input.move_to(&model, x1, y1)?;
+                self.input.button(button, true)?;
                 for i in 1..=steps {
                     let t = i as f64 / steps as f64;
                     let cx = x1 as f64 + (x2 - x1) as f64 * t;
                     let cy = y1 as f64 + (y2 - y1) as f64 * t;
-                    self.desktop.move_pointer(cx as i16, cy as i16)?;
+                    self.input
+                        .move_to(&model, cx.round() as i32, cy.round() as i32)?;
                 }
-                self.desktop.click(button, false)?;
-                self.desktop.sync();
+                self.input.button(button, false)?;
                 self.record_input(t0);
                 Ok(text_result(
-                    format!("dragged ({x1},{y1}) -> ({x2},{y2}) button {button} in {steps} steps"),
+                    format!("dragged ({x1},{y1}) -> ({x2},{y2}) with {button:?} in {steps} steps"),
                     false,
                 ))
             }
 
             "scroll" => {
-                let amount = arg_i64(args, "amount").unwrap_or(3);
+                let amount = arg_i64(args, "amount").unwrap_or(3).unsigned_abs().min(50) as i32;
                 let direction = arg_str(args, "direction").unwrap_or("down");
-                let (button, times) = match direction {
-                    "up" => (4u8, amount.unsigned_abs().min(50)),
-                    "down" => (5u8, amount.unsigned_abs().min(50)),
-                    "left" => (6u8, amount.unsigned_abs().min(50)),
-                    "right" => (7u8, amount.unsigned_abs().min(50)),
-                    other => return Err(anyhow!("bad direction '{other}'")),
+                let at = match (arg_i64(args, "x"), arg_i64(args, "y")) {
+                    (Some(x), Some(y)) => Some((x as i32, y as i32)),
+                    _ => None,
                 };
+                let model = self.model_snapshot();
                 let t0 = std::time::Instant::now();
-                if let (Some(x), Some(y)) = (arg_i64(args, "x"), arg_i64(args, "y")) {
-                    self.desktop.move_pointer(x as i16, y as i16)?;
-                }
-                for _ in 0..times {
-                    self.desktop.click(button, true)?;
-                    self.desktop.click(button, false)?;
-                }
-                self.desktop.sync();
+                let report = self.input.scroll(&model, direction, amount, at)?;
                 self.record_input(t0);
                 Ok(text_result(
-                    format!(
-                        "scrolled {direction} x{times}{}",
-                        coords_note(
-                            arg_i64(args, "x").map(|v| v as i16),
-                            arg_i64(args, "y").map(|v| v as i16)
-                        )
-                    ),
+                    self.describe(&report, &format!("scrolled {direction} x{amount}")),
                     false,
                 ))
             }
@@ -490,7 +469,7 @@ impl App {
             "type" => {
                 let text = arg_str(args, "text").ok_or_else(|| anyhow!("text is required"))?;
                 let t0 = std::time::Instant::now();
-                self.type_text(text)?;
+                self.input.type_text(text)?;
                 self.record_input(t0);
                 Ok(text_result(
                     format!("typed {} characters", text.chars().count()),
@@ -501,7 +480,7 @@ impl App {
             "hotkey" => {
                 let keys = arg_str(args, "keys").ok_or_else(|| anyhow!("keys is required"))?;
                 let t0 = std::time::Instant::now();
-                self.hotkey(keys)?;
+                self.input.hotkey(keys)?;
                 self.record_input(t0);
                 Ok(text_result(format!("pressed {keys}"), false))
             }
@@ -520,8 +499,6 @@ impl App {
                 })?;
                 let origin_x = arg_f64(args, "origin_x").unwrap_or(0.0);
                 let origin_y = arg_f64(args, "origin_y").unwrap_or(0.0);
-                // If the caller supplies the source region width we can derive the
-                // scale exactly; otherwise they must pass it in.
                 let src_w = arg_f64(args, "source_width").unwrap_or(img_w);
                 let scale = if img_w > 0.0 { img_w / src_w } else { 1.0 };
                 let sx = (origin_x + u / scale).round() as i64;
@@ -531,7 +508,9 @@ impl App {
                         "screen_x": sx,
                         "screen_y": sy,
                         "scale_used": scale,
-                        "note": "pass screen_x/screen_y to click or mouse_move"
+                        "note": "pass screen_x/screen_y to click or mouse_move; these are \
+                                 native capture pixels, which is the same space every input \
+                                 backend expects"
                     }))?,
                     false,
                 ))
@@ -539,6 +518,7 @@ impl App {
 
             "desktop_stats" => {
                 let st = self.stats.lock().unwrap();
+                let model = self.model.lock().unwrap().clone();
                 Ok(text_result(
                     serde_json::to_string_pretty(&json!({
                         "captures": st.captures,
@@ -547,6 +527,11 @@ impl App {
                         "inputs": st.inputs,
                         "input_ms_avg": if st.inputs>0 { st.input_ms_total / st.inputs as f64 } else { 0.0 },
                         "input_ms_total": st.input_ms_total,
+                        "session_type": self.platform.session.as_str(),
+                        "capture_backend": self.capture.backend().as_str(),
+                        "input_backend": self.input.backend().as_str(),
+                        "coordinate_scale": model.scale,
+                        "scale_source": model.scale_source,
                     }))?,
                     false,
                 ))
@@ -554,6 +539,38 @@ impl App {
 
             other => Err(anyhow!("unknown tool: {other}")),
         }
+    }
+
+    fn model_snapshot(&self) -> CoordinateModel {
+        self.model.lock().unwrap().clone()
+    }
+
+    /// Build a human- and machine-readable description of an input action,
+    /// always stating whether the result could be verified.
+    fn describe(&self, r: &crate::input::InputReport, what: &str) -> String {
+        let mut s = what.to_string();
+        if r.requested.0 >= 0 {
+            s.push_str(&format!(
+                " at requested ({}, {})",
+                r.requested.0, r.requested.1
+            ));
+        }
+        if r.emitted.0 >= 0 {
+            s.push_str(&format!(" emitted ({}, {})", r.emitted.0, r.emitted.1));
+        }
+        if r.clamped {
+            s.push_str(" [position clamped to the screen edge]");
+        }
+        s.push_str(&format!("\nbackend: {}", self.input.backend().as_str()));
+        if r.verified {
+            s.push_str("\nposition verified via the X server pointer");
+        } else if self.input.has_absolute_pointer() {
+            s.push_str(
+                "\nnote: the event was delivered to the kernel, but this backend cannot read \
+                 the pointer back, so the landing position is not independently confirmed",
+            );
+        }
+        s
     }
 
     fn record_input(&self, t0: std::time::Instant) {
@@ -564,9 +581,64 @@ impl App {
     }
 }
 
-fn coords_note(x: Option<i16>, y: Option<i16>) -> String {
-    match (x, y) {
-        (Some(x), Some(y)) => format!(" at ({x}, {y})"),
-        _ => String::new(),
+/// Cheap "is this frame effectively black" test on a sampled grid.
+///
+/// Used only to decide whether to attach a diagnostic warning, never to alter
+/// the pixels.
+fn is_effectively_black(img: &RgbImage) -> bool {
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return true;
+    }
+    let step_x = (w / 32).max(1);
+    let step_y = (h / 32).max(1);
+    let mut samples = 0u32;
+    let mut bright = 0u32;
+    let mut y = 0;
+    while y < h {
+        let mut x = 0;
+        while x < w {
+            let p = img.get_pixel(x, y);
+            // Anything clearly above black counts as content.
+            if p[0] > 8 || p[1] > 8 || p[2] > 8 {
+                bright += 1;
+            }
+            samples += 1;
+            x += step_x;
+        }
+        y += step_y;
+    }
+    samples == 0 || (bright as f64 / samples as f64) < 0.005
+}
+
+fn region_args(args: &Value) -> Option<(i32, i32, u32, u32)> {
+    match (
+        arg_i64(args, "x"),
+        arg_i64(args, "y"),
+        arg_i64(args, "width"),
+        arg_i64(args, "height"),
+    ) {
+        (Some(x), Some(y), Some(w), Some(h)) if w > 0 && h > 0 => {
+            Some((x as i32, y as i32, w as u32, h as u32))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_requires_all_four_positive_arguments() {
+        assert_eq!(
+            region_args(&json!({"x": 1, "y": 2, "width": 3, "height": 4})),
+            Some((1, 2, 3, 4))
+        );
+        assert_eq!(region_args(&json!({"x": 1, "y": 2, "width": 3})), None);
+        assert_eq!(
+            region_args(&json!({"x": 1, "y": 2, "width": 0, "height": 4})),
+            None
+        );
     }
 }

@@ -1,9 +1,18 @@
-//! linux-desktop-mcp — a fast, dependency-light computer-use MCP server for X11.
+//! linux-desktop-mcp — a fast, dependency-light computer-use MCP server for
+//! Linux desktops on **both** X11 and Wayland.
 //!
-//! Speaks MCP over stdio. No C bindings, no subprocesses, no AT-SPI requirement.
+//! Speaks MCP over stdio. Capture and input are each chosen from an ordered
+//! set of backends at startup, and the choice is reported through
+//! `screen_info` so a caller always knows what is actually serving it.
 
+mod capture;
+mod dbus;
+mod input;
+mod mutter;
+mod platform;
 mod protocol;
 mod tools;
+mod uinput;
 mod x11;
 
 use protocol::*;
@@ -12,7 +21,7 @@ use std::io::{BufReader, BufWriter, Write};
 use tools::App;
 
 const SERVER_NAME: &str = "linux-desktop";
-const SERVER_VERSION: &str = "0.1.0";
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn tool_list() -> Value {
     json!([
@@ -186,7 +195,12 @@ fn main() {
     let app = match App::new() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("[linux-desktop-mcp] fatal: cannot initialise X11 backend: {e:#}");
+            eprintln!("[linux-desktop-mcp] fatal: cannot initialise any desktop backend: {e:#}");
+            eprintln!(
+                "[linux-desktop-mcp] hint: this server supports X11 sessions directly and \
+                 Wayland sessions through xdg-desktop-portal (capture) plus /dev/uinput \
+                 (input). See the README for the one-time uinput udev rule."
+            );
             std::process::exit(1);
         }
     };

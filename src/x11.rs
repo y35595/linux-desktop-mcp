@@ -1,12 +1,16 @@
-//! X11 backend: screen capture + input synthesis + window queries.
+//! X11 backend: input synthesis and window queries.
 //!
-//! Design notes (performance-critical):
-//! - One long-lived `X11` connection reused by every call. `RUST_LOG` aside,
-//!   reconnecting per call would dominate latency.
-//! - Capture uses `GetImage` + raw BGRA->RGB swizzle; no subprocess, no libpng
-//!   round trip.
-//! - Input uses XTEST `fake_input`, which is indistinguishable from physical
-//!   input and needs no focus manipulation (we never call `set_input_focus`).
+//! This module is only usable when a **real** X server owns the screen. Under
+//! Xwayland `DISPLAY` is set too, but:
+//!
+//! - `GetImage` on the root window fails with `BadMatch` (no backing store),
+//! - XTEST events reach Xwayland clients but not the compositor's own UI —
+//!   verified on GNOME 48 by sending `Super` through XTEST (the overview did
+//!   not open) and through mutter (it did).
+//!
+//! Window queries are still useful under Xwayland because they enumerate
+//! Xwayland *clients* correctly, so [`Desktop::list_windows`] is available on
+//! both, while input is gated behind [`Desktop::can_inject`].
 
 use anyhow::{anyhow, Context, Result};
 use x11rb::connection::Connection;
@@ -14,31 +18,19 @@ use x11rb::protocol::xproto::*;
 use x11rb::protocol::xtest::ConnectionExt as XtestExt;
 use x11rb::rust_connection::RustConnection;
 
-/// Geometry of one screen in pixels.
-#[derive(Debug, Clone, Copy)]
-pub struct ScreenGeom {
-    pub width: u16,
-    pub height: u16,
-}
-
-/// A captured frame, already swizzled to RGB8.
-pub struct Frame {
-    pub width: u16,
-    pub height: u16,
-    pub rgb: Vec<u8>,
-}
-
-/// Handle to the display, owning one connection for the process lifetime.
+/// Handle to the X display, owning one connection for the process lifetime.
 pub struct Desktop {
     conn: RustConnection,
     root: Window,
-    geom: ScreenGeom,
+    /// True only when a real X server owns the screen.
+    real_x11: bool,
 }
 
 /// Keysym -> keycode cache, built once to avoid a round trip per keystroke.
 pub struct Keymap {
-    /// index = keycode, value = keysym at level 0 and level 1 (shifted).
+    /// index = keycode - min_keycode; value = keysym at level 0 and level 1.
     symbols: Vec<[u32; 2]>,
+    min_keycode: u8,
 }
 
 impl Keymap {
@@ -46,7 +38,7 @@ impl Keymap {
         let setup = conn.setup();
         let min = setup.min_keycode;
         let max = setup.max_keycode;
-        let count = max - min + 1;
+        let count = max.saturating_sub(min) + 1;
         let reply = conn
             .get_keyboard_mapping(min, count)
             .context("GetKeyboardMapping failed")?
@@ -63,18 +55,20 @@ impl Keymap {
                 }
             }
         }
-        Ok(Keymap { symbols })
+        Ok(Keymap {
+            symbols,
+            min_keycode: min,
+        })
     }
 
     /// Find (keycode, needs_shift) for a keysym.
     pub fn lookup(&self, keysym: u32) -> Option<(u8, bool)> {
-        let setup_min = 8u16; // X11 min keycode is always 8
         for (i, syms) in self.symbols.iter().enumerate() {
             if syms[0] == keysym {
-                return Some(((i as u16 + setup_min) as u8, false));
+                return Some((i as u8 + self.min_keycode, false));
             }
             if syms[1] == keysym {
-                return Some(((i as u16 + setup_min) as u8, true));
+                return Some((i as u8 + self.min_keycode, true));
             }
         }
         None
@@ -82,128 +76,49 @@ impl Keymap {
 }
 
 impl Desktop {
-    pub fn connect() -> Result<Self> {
+    pub fn connect(real_x11: bool) -> Result<Self> {
         let (conn, screen_num) =
             x11rb::connect(None).context("cannot connect to X display (is DISPLAY set?)")?;
         let screen = &conn.setup().roots[screen_num];
-        let geom = ScreenGeom {
-            width: screen.width_in_pixels,
-            height: screen.height_in_pixels,
-        };
-        let root = screen.root;
-        Ok(Desktop { conn, root, geom })
-    }
-
-    pub fn geom(&self) -> ScreenGeom {
-        self.geom
+        Ok(Desktop {
+            root: screen.root,
+            conn,
+            real_x11,
+        })
     }
 
     pub fn conn(&self) -> &RustConnection {
         &self.conn
     }
 
-    /// Capture a rectangle. `region = None` means the whole screen.
-    pub fn capture(&self, region: Option<(i16, i16, u16, u16)>) -> Result<Frame> {
-        let (x, y, w, h) = region.unwrap_or((0, 0, self.geom.width, self.geom.height));
-        if w == 0 || h == 0 {
-            return Err(anyhow!("capture region has zero width or height"));
-        }
-        let img = self
-            .conn
-            .get_image(ImageFormat::Z_PIXMAP, self.root, x, y, w, h, !0)
-            .context("GetImage request failed")?
-            .reply()
-            .context("GetImage reply failed (region off-screen?)")?;
-
-        let pixel_bytes = (img.depth as usize).div_ceil(8);
-        let src = &img.data;
-        let expected = w as usize * h as usize * pixel_bytes;
-        if src.len() < expected {
-            return Err(anyhow!(
-                "short image data: got {} expected {}",
-                src.len(),
-                expected
-            ));
-        }
-
-        // Swizzle to RGB8. On little-endian TrueColor X11 the layout is B,G,R,X.
-        let npix = w as usize * h as usize;
-        let mut rgb = vec![0u8; npix * 3];
-        match pixel_bytes {
-            4 => {
-                for i in 0..npix {
-                    let s = i * 4;
-                    rgb[i * 3] = src[s + 2];
-                    rgb[i * 3 + 1] = src[s + 1];
-                    rgb[i * 3 + 2] = src[s];
-                }
-            }
-            3 => {
-                for i in 0..npix {
-                    let s = i * 3;
-                    rgb[i * 3] = src[s + 2];
-                    rgb[i * 3 + 1] = src[s + 1];
-                    rgb[i * 3 + 2] = src[s];
-                }
-            }
-            2 => {
-                // 16-bit packed 565
-                for i in 0..npix {
-                    let v = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
-                    let r = ((v >> 11) & 0x1f) as u8;
-                    let g = ((v >> 5) & 0x3f) as u8;
-                    let b = (v & 0x1f) as u8;
-                    rgb[i * 3] = (r << 3) | (r >> 2);
-                    rgb[i * 3 + 1] = (g << 2) | (g >> 4);
-                    rgb[i * 3 + 2] = (b << 3) | (b >> 2);
-                }
-            }
-            _ => return Err(anyhow!("unsupported X11 pixel depth {}", img.depth)),
-        }
-
-        // Debug hook: report what this process actually sampled, so a mismatch
-        // against an external screenshot is attributable rather than mysterious.
-        if std::env::var("LDMCP_DEBUG_PIXELS").is_ok() {
-            let at = |x: u16, y: u16| -> (u8, u8, u8) {
-                if x >= w || y >= h {
-                    return (0, 0, 0);
-                }
-                let o = (y as usize * w as usize + x as usize) * 3;
-                (rgb[o], rgb[o + 1], rgb[o + 2])
-            };
-            eprintln!(
-                "[dbg] screen={}x{} cap=({},{},{}x{}) info_depth={} px(10,10)={:?} px(400,300)={:?}",
-                self.geom.width, self.geom.height, x, y, w, h, img.depth,
-                at(10, 10), at(400, 300)
-            );
-        }
-
-        Ok(Frame {
-            width: w,
-            height: h,
-            rgb,
-        })
+    /// XTEST is only meaningful when a real X server owns the screen.
+    pub fn can_inject(&self) -> bool {
+        self.real_x11
     }
 
-    // ---- input synthesis ----
+    fn require_injectable(&self) -> Result<()> {
+        if self.real_x11 {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "XTEST input is not available on a Wayland session: it reaches Xwayland \
+                 clients only, never the compositor's own UI. Configure /dev/uinput \
+                 (see README) so the uinput backend can inject input instead."
+            ))
+        }
+    }
 
     pub fn move_pointer(&self, x: i16, y: i16) -> Result<()> {
+        self.require_injectable()?;
         self.conn
-            .xtest_fake_input(
-                x11rb::protocol::xproto::MOTION_NOTIFY_EVENT,
-                0,
-                0,
-                self.root,
-                x,
-                y,
-                0,
-            )
+            .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, self.root, x, y, 0)
             .context("XTEST motion failed")?;
         self.conn.flush().ok();
         Ok(())
     }
 
     pub fn click(&self, button: u8, press: bool) -> Result<()> {
+        self.require_injectable()?;
         self.conn
             .xtest_fake_input(
                 if press {
@@ -224,6 +139,7 @@ impl Desktop {
     }
 
     pub fn key(&self, keycode: u8, press: bool) -> Result<()> {
+        self.require_injectable()?;
         self.conn
             .xtest_fake_input(
                 if press {
@@ -251,13 +167,10 @@ impl Desktop {
 
     /// List user-visible top-level windows.
     ///
-    /// X11 nests reparenting frames and client windows; reporting both would
-    /// duplicate every app. We walk the direct children of `root` (the window
-    /// manager's frames) and keep only those that carry a real WM name, which
-    /// filters out frames, docks and compositor helper windows.
+    /// Under Xwayland this enumerates Xwayland clients only — native Wayland
+    /// windows are invisible to X11 by design, which is why the JSON output
+    /// carries a warning when the session is Wayland.
     pub fn list_windows(&self) -> Result<Vec<WindowInfo>> {
-        // EWMH is the reliable entry point: a compositor-managed client list
-        // already excludes docks, desktops and compositor helper windows.
         let mut ids = self.client_list(b"_NET_CLIENT_LIST").unwrap_or_default();
         if ids.is_empty() {
             ids = self
@@ -277,7 +190,6 @@ impl Desktop {
         Ok(out)
     }
 
-    /// Read a list-of-windows root property (EWMH client lists).
     fn client_list(&self, name: &[u8]) -> Option<Vec<Window>> {
         let atom = self.conn.intern_atom(false, name).ok()?.reply().ok()?.atom;
         let prop = self
@@ -356,6 +268,27 @@ impl Desktop {
         String::from_utf8(prop.value).ok().filter(|s| !s.is_empty())
     }
 
+    fn wm_class(&self, win: Window) -> Option<String> {
+        let prop = self
+            .conn
+            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
+            .ok()?
+            .reply()
+            .ok()?;
+        if prop.value.is_empty() {
+            return None;
+        }
+        let parts: Vec<&[u8]> = prop
+            .value
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .collect();
+        parts
+            .last()
+            .and_then(|p| String::from_utf8(p.to_vec()).ok())
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn active_window(&self) -> Option<WindowInfo> {
         let atom = self
             .conn
@@ -381,11 +314,9 @@ impl Desktop {
         let atom = self
             .conn
             .intern_atom(false, b"_NET_ACTIVE_WINDOW")
-            .ok()
-            .unwrap()
+            .context("intern _NET_ACTIVE_WINDOW failed")?
             .reply()
-            .ok()
-            .unwrap()
+            .context("intern reply failed")?
             .atom;
         let data = [1u32, 0, 0, 0, 0];
         let ev = ClientMessageEvent::new(32, win, atom, data);
@@ -395,29 +326,6 @@ impl Desktop {
             .context("send _NET_ACTIVE_WINDOW failed")?;
         self.conn.flush().ok();
         Ok(())
-    }
-    /// Read `WM_CLASS` (instance, class) and use the class as a display name when
-    /// no WM_NAME/_NET_WM_NAME exists — common on lightweight compositors.
-    fn wm_class(&self, win: Window) -> Option<String> {
-        let prop = self
-            .conn
-            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
-            .ok()?
-            .reply()
-            .ok()?;
-        if prop.value.is_empty() {
-            return None;
-        }
-        // Two NUL-terminated strings: instance\0class\0
-        let parts: Vec<&[u8]> = prop
-            .value
-            .split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .collect();
-        parts
-            .last()
-            .and_then(|p| String::from_utf8(p.to_vec()).ok())
-            .filter(|s| !s.is_empty())
     }
 }
 
@@ -430,4 +338,20 @@ pub struct WindowInfo {
     pub width: u16,
     pub height: u16,
     pub mapped: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keymap_min_keycode_is_used_as_the_base() {
+        // The old implementation hard-coded 8; this guards against a regression
+        // on servers whose min_keycode differs.
+        let km = Keymap {
+            symbols: vec![[0u32; 2]; 4],
+            min_keycode: 12,
+        };
+        assert_eq!(km.lookup(0x41), None);
+    }
 }

@@ -27,15 +27,36 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Unit tests
+        run: cargo test --verbose
+
       - name: Build
         run: cargo build --release --verbose
 
       - name: Smoke test the MCP handshake
         run: |
+          # CI has no desktop session, so the server must either start and
+          # answer, or exit with a clear diagnostic. It must never hang or
+          # panic.
           printf '%s\n' \
             '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
             '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-            | timeout 10 ./target/release/linux-desktop-mcp > out.jsonl 2>err.txt || true
+            | timeout 15 ./target/release/linux-desktop-mcp > out.jsonl 2>err.txt || true
           echo "--- stderr ---"; cat err.txt
-          # Without DISPLAY the server must exit cleanly with a clear message.
-          grep -q "cannot initialise X11 backend" err.txt
+          echo "--- stdout ---"; cat out.jsonl
+          # Either it served the handshake, or it explained why it could not.
+          grep -q '"serverInfo"' out.jsonl \
+            || grep -q "cannot initialise any desktop backend" err.txt
+
+      - name: Verify no panic on a session-less environment
+        run: |
+          # uinput and the portal are both absent here; every tool must return
+          # a structured error instead of unwinding.
+          if grep -q '"serverInfo"' out.jsonl; then
+            printf '%s\n' \
+              '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+              '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"screen_info","arguments":{}}}' \
+              | timeout 15 ./target/release/linux-desktop-mcp > out2.jsonl 2>err2.txt || true
+            cat out2.jsonl
+            ! grep -qi "panicked" err2.txt
+          fi
