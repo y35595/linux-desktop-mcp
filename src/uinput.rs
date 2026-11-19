@@ -335,6 +335,43 @@ pub fn probe() -> Availability {
     }
 }
 
+/// Wait until udev has created an event node for our virtual device.
+///
+/// A fixed sleep is not enough: mutter's libinput picks a device up
+/// asynchronously, and events written before it does are dropped. Polling
+/// sysfs makes the first click deterministic instead of racy.
+///
+/// Returns the `/dev/input/eventN` path once it appears, or `None` if the
+/// timeout expires (the device often still works, so this is advisory).
+fn wait_for_event_node(device_name: &str, timeout: std::time::Duration) -> Option<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(entries) = std::fs::read_dir("/sys/class/input") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name()?.to_str()?.to_string();
+                if !name.starts_with("event") {
+                    continue;
+                }
+                let dev_name = path.join("device/name");
+                if let Ok(n) = std::fs::read_to_string(&dev_name) {
+                    if n.trim() == device_name {
+                        // The device node may lag the sysfs entry slightly.
+                        let node = format!("/dev/input/{name}");
+                        if std::path::Path::new(&node).exists() {
+                            return Some(node);
+                        }
+                    }
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn check(rc: i32, what: &str) -> Result<()> {
     if rc < 0 {
         Err(anyhow!(
@@ -346,11 +383,16 @@ fn check(rc: i32, what: &str) -> Result<()> {
     }
 }
 
+/// Set one capability bit.
+///
+/// `UI_SET_*BIT` pass the bit number **by value** as the ioctl argument
+/// (`_IOC(_IOC_WRITE, 'U', nr, sizeof(int))` describes the *type* for
+/// documentation only). Passing a pointer here makes the kernel treat the
+/// address as the bit index and reject it with EINVAL.
 fn set_bit(fd: i32, request: u64, bit: u16, what: &str) -> Result<()> {
-    let v = bit as u32;
-    // SAFETY: fd is an open uinput descriptor owned by the caller, and `v`
-    // outlives the call.
-    let rc = unsafe { ioctl(fd, request, &v as *const u32) };
+    // SAFETY: fd is an open uinput descriptor owned by the caller; the ioctl
+    // takes an integer argument, so no pointer is involved.
+    let rc = unsafe { ioctl(fd, request, bit as u32 as std::os::raw::c_ulong) };
     check(rc, what)
 }
 
@@ -464,7 +506,11 @@ impl AbsPointer {
 
         // udev/libinput need a moment to enumerate the new node, otherwise the
         // first few events are dropped.
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        // libinput only accepts events once it has enumerated the device.
+        let _ = wait_for_event_node(
+            "linux-desktop-mcp abs pointer",
+            std::time::Duration::from_millis(3000),
+        );
 
         Ok(AbsPointer {
             file,
@@ -712,7 +758,10 @@ impl VirtualKeyboard {
         )?;
         // SAFETY: fd is a valid open uinput descriptor.
         check(unsafe { ioctl(fd, ui_dev_create()) }, "UI_DEV_CREATE")?;
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        let _ = wait_for_event_node(
+            "linux-desktop-mcp keyboard",
+            std::time::Duration::from_millis(3000),
+        );
 
         Ok(VirtualKeyboard { file })
     }
